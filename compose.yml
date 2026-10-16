@@ -1,0 +1,30 @@
+# 箱に1台の共有 ollama（量子化したモデル〈GGUF〉を動かす係）。公式イメージ ollama/ollama、版は .env の OLLAMA_VERSION。
+# ほかの compose プロジェクトは external network `ollama` に参加して、ホスト名 `ollama` の 11434 番に繋ぐ
+# （OpenAI 互換の口は http://ollama:11434/v1）。ホスト側からは 127.0.0.1:11434 だけ（外には開けない）。
+name: ollama
+
+services:
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.40.5}
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    environment:
+      # 使わないモデルをメモリから下ろすまでの時間。-1＝下ろさない（呼ばれるたびに読み直さないよう常駐）
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+    volumes:
+      - models:/root/.ollama    # 落としたモデル（ollama_models）。down に -v を付けなければ残る
+    # 箱のほかのサービスを守る安全弁。埋め込みモデル（embeddinggemma Q8 で約 0.6GiB）なら十分。
+    # 大きいモデルを載せるときは .env の OLLAMA_MEM_LIMIT で上げる（Qwen3-Embedding 4B Q4 は読み込みで 3.1GiB）
+    mem_limit: ${OLLAMA_MEM_LIMIT:-3g}
+
+networks:
+  default:
+    # 固定名。ほかのプロジェクトから `external: true` で参照する
+    name: ollama
+
+volumes:
+  models:
