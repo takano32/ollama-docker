@@ -1,11 +1,12 @@
 # 箱に1台の共有 ollama（量子化したモデル〈GGUF〉を動かす係）。公式イメージ ollama/ollama、版は .env の OLLAMA_VERSION。
 # ほかの compose プロジェクトは external network `ollama` に参加して、ホスト名 `ollama` の 11434 番に繋ぐ
 # （OpenAI 互換の口は http://ollama:11434/v1）。ホスト側からは 127.0.0.1:11434 だけ（外には開けない）。
+# 2つ目のサービス mcp は、ollama の小型 LLM を MCP の道具にして出す橋渡し（既存の公開パッケージを bunx で起こす。自作しない）。
 name: ollama
 
 services:
   ollama:
-    image: ollama/ollama:${OLLAMA_VERSION:-0.40.5}
+    image: ollama/ollama:${OLLAMA_VERSION:-0.40.5}   # arm64 あり。2026-10-16 時点の最新リリース
     container_name: ollama
     restart: unless-stopped
     ports:
@@ -13,13 +14,33 @@ services:
     environment:
       # 使わないモデルをメモリから下ろすまでの時間。-1＝下ろさない（呼ばれるたびに読み直さないよう常駐）
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
-      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      # 同時に載せるモデルの数。2＝埋め込み（Hindsight 用）と小型 LLM（MCP 用）を両方常駐させる
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
       OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
     volumes:
       - models:/root/.ollama    # 落としたモデル（ollama_models）。down に -v を付けなければ残る
-    # 箱のほかのサービスを守る安全弁。埋め込みモデル（embeddinggemma Q8 で約 0.6GiB）なら十分。
-    # 大きいモデルを載せるときは .env の OLLAMA_MEM_LIMIT で上げる（Qwen3-Embedding 4B Q4 は読み込みで 3.1GiB）
-    mem_limit: ${OLLAMA_MEM_LIMIT:-3g}
+    # 箱のほかのサービスを守る安全弁。embeddinggemma Q8 と qwen3 1.7B Q4_K_M を同時に載せた待機が約 2.5GiB（README の計測）。
+    # もっと大きいモデルを載せるときは .env の OLLAMA_MEM_LIMIT で上げる（Qwen3-Embedding 4B Q4 は読み込みで 3.1GiB）
+    mem_limit: ${OLLAMA_MEM_LIMIT:-4g}
+
+  # MCP の橋渡し。ollama-mcp-server（hyzhak、stdio。run／chat_completion に think と temperature を渡せる。pull／push／rm／cp／create の
+  # 道具も出すので、使う側（Claude Code）の deny で塞ぐ＝README）を mcp-proxy で streamable HTTP にする。Claude Code からは http://127.0.0.1:11435/mcp
+  mcp:
+    image: oven/bun:${BUN_VERSION:-1.4.3-alpine}   # arm64 あり
+    container_name: ollama-mcp
+    restart: unless-stopped
+    depends_on: [ollama]
+    ports:
+      - "127.0.0.1:${OLLAMA_MCP_PORT:-11435}:8080"
+    environment:
+      OLLAMA_HOST: http://ollama:11434   # 橋渡しが叩く先。モデルは道具の引数で指す（既定は無い。README の qwen3:1.7b と think:false）
+    # --server stream: streamable HTTP だけ（旧い SSE の口は開けない）。--host 0.0.0.0: コンテナ内で全 IF（外へは ports の 127.0.0.1 だけ）
+    # bunx --bun: 橋渡しの cli が node を spawn するので、bun を node として見せる
+    command: ["bunx", "mcp-proxy@${MCP_PROXY_VERSION:-6.7.20}", "--host", "0.0.0.0", "--port", "8080", "--server", "stream", "--",
+              "bunx", "--bun", "ollama-mcp-server@${OLLAMA_MCP_VERSION:-1.1.0}"]
+    volumes:
+      - bun_cache:/root/.bun    # bunx が落としたパッケージ。再起動のたびに落とし直さない
+    mem_limit: ${OLLAMA_MCP_MEM_LIMIT:-512m}   # 実測の待機 74MiB
 
 networks:
   default:
@@ -28,3 +49,4 @@ networks:
 
 volumes:
   models:
+  bun_cache:
