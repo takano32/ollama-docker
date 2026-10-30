@@ -1,55 +1,11 @@
 # ollama-docker
 
-箱に1台の共有の埋め込みサーバー。**2026-10-30 から中身は ollama ではなく llama.cpp 公式のサーバーイメージ**
-（[`ghcr.io/ggml-org/llama.cpp:server-b12004`](https://github.com/ggml-org/llama.cpp/blob/master/docs/docker.md)、arm64 あり）で、
-埋め込みモデル `bge-m3`（1024次元）を1本だけ直接動かす。リポ名・compose のプロジェクト名・network 名（`ollama`）・ボリューム名（`ollama_models`）・
-ホスト名（`ollama`）・ポート（11434）は ollama 時代のままにしてあり、使う側（hindsight-docker、honcho-docker）は何も変えていない。
+箱に1台の共有 [ollama](https://github.com/ollama/ollama)。量子化したモデル（GGUF）を動かす係で、
+埋め込みや小さい LLM を使いたいサービスは、ollama をそれぞれ立てずにここへ繋ぐ（モデルとイメージが重いので1台にまとめる）。
+公式イメージ `ollama/ollama` をそのまま使う（版は `.env` の `OLLAMA_VERSION`、既定 0.40.5＝2026-10-16 時点の最新リリース、arm64 あり）。
+2つ目のサービス `mcp` は、ollama の小型 LLM を MCP の道具として出す橋渡し（既存の公開パッケージを bunx で起こす。自作しない）。
 
-## いまの形（2026-10-30〜）
-
-| 項目 | 値 |
-|---|---|
-| サービス／コンテナ | `embed`／`bge-m3-embed` |
-| イメージ | `ghcr.io/ggml-org/llama.cpp:server-b12004`（build 12004、commit 3c809f443。`.env` の `LLAMA_CPP_VERSION` で替える） |
-| プロセス名 | `bge-m3-embed`（`/app/llama-server` への symlink `/app/bge-m3-embed` を張って exec する。`ps` と `/proc/<pid>/comm` にこの名前が出る） |
-| 重み | ollama が落とした bge-m3 の blob `sha256-daec91ff…3062c` を、ボリューム `ollama_models` の読み取り専用マウント（`/models`）から直接読む。コピーしていない |
-| 口 | network `ollama` 上の alias `ollama`、ポート 11434。ホストからは `127.0.0.1:11434` だけ。OpenAI 互換の `http://ollama:11434/v1/embeddings` |
-| model 欄 | `--alias bge-m3`。リクエストの model 欄は何を書いても通る（`bge-m3`、`bge-m3:latest` で確かめた） |
-| 引数 | `--embedding -c 4096 -np 1 -b 2048 -ub 2048 --flash-attn auto --no-webui --offline`（ollama 0.40.5 が bge-m3 に立てていた llama-server の起動に合わせた） |
-| メモリ上限 | `2g`（`.env` の `EMBED_MEM_LIMIT`） |
-
-```sh
-cd ~/opt/ollama-docker
-docker compose up -d                       # embed だけが上がる
-curl -s http://127.0.0.1:11434/health
-curl -s http://127.0.0.1:11434/v1/embeddings -H 'Content-Type: application/json' -d '{"model":"bge-m3","input":"テスト"}'
-```
-
-### 切り替えたときの確かめ（2026-10-30）
-
-- 同じ10文（日本語7・英語2・1文字1）を旧 ollama（`/v1/embeddings`）と新サーバーに通し、同じ文どうしのコサインは10文すべて 1.000000（最小 0.9999999999999991）、次元は 1024、ノルムは 1.0000 で一致。
-- hindsight、honcho-api、honcho-deriver の各コンテナから `http://ollama:11434/v1/embeddings` が 1024 次元で返った。honcho-api ではその中の埋め込みクライアント（`src/embedding_client.py`）を直接呼んで 1024 次元を確かめた。
-- メモリ（`docker stats`）は旧 ollama 697.7MiB（＋ollama-mcp 17.5MiB）、新 bge-m3-embed 154.2MiB。ただし新しいほうは GGUF を mmap しており、
-  そのページキャッシュ（約 1.1GB、`RssFile`）は先に読んだ ollama 側の cgroup に計上されていたぶんが残っているので、`docker stats` には出ていない。
-  プロセスの `RssAnon` は 139MiB。箱全体の `free` の used は 4887MiB から 4419MiB に減った（入れ替え前は試験用のコンテナも動いていた）。
-
-## 戻し方（ollama に戻す）
-
-ollama と MCP の橋渡しは compose の profile `ollama` に退避してある。イメージ `ollama/ollama:0.40.5` とボリューム `ollama_models`／`ollama_bun_cache` は消していない。
-
-```sh
-cd ~/opt/ollama-docker
-docker compose stop embed && docker compose rm -f embed
-docker compose --profile ollama up -d ollama mcp
-```
-
-`embed` と `ollama` は同じホスト名 `ollama`・同じポート 11434 を取り合うので、同時には上げない。
-
----
-
-以下は ollama 時代（〜2026-10-30）の記録。
-
-## 使い方（ollama 時代）
+## 使い方
 
 ```sh
 cd ~/opt/ollama-docker
