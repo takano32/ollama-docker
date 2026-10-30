@@ -1,46 +1,98 @@
-# 箱に1台の共有 ollama（量子化したモデル〈GGUF〉を動かす係）。公式イメージ ollama/ollama、版は .env の OLLAMA_VERSION。
-# ほかの compose プロジェクトは external network `ollama` に参加して、ホスト名 `ollama` の 11434 番に繋ぐ
-# （OpenAI 互換の口は http://ollama:11434/v1）。ホスト側からは 127.0.0.1:11434 だけ（外には開けない）。
-# 2つ目のサービス mcp は、ollama の小型 LLM を MCP の道具にして出す橋渡し（既存の公開パッケージを bunx で起こす。自作しない）。
+# 箱に1台の共有の埋め込みサーバー。2026-10-30 から ollama をやめ、llama.cpp 公式のサーバーイメージ（ghcr.io/ggml-org/llama.cpp:server-bNNNNN）で
+# bge-m3 を直接動かす（ollama serve が子に llama-server を立てて ps に llama-server と出るのが不自然、という takano32 の指摘から）。
+# ほかの compose プロジェクトは external network `ollama` に参加して、ホスト名 `ollama`（network alias）の 11434 番に繋ぐ
+# （OpenAI 互換の口は http://ollama:11434/v1、埋め込みは /v1/embeddings。model 欄は何を書いても bge-m3 が答える）。
+# ホスト側からは 127.0.0.1:11434 だけ（外には開けない）。プロジェクト名・network 名・ボリューム名は ollama 時代のまま（向こうから何も変えないため）。
+#
+# 戻し方（ollama に戻す）: 下の ollama と mcp は profile `ollama` に退避してあり、イメージ（ollama/ollama:0.40.5）もボリューム ollama_models も残っている。
+#   docker compose stop embed && docker compose rm -f embed
+#   docker compose --profile ollama up -d ollama mcp
+# （ollama と embed は同じホスト名 `ollama`・同じポート 11434 を取り合うので、同時には上げない）
 name: ollama
 
 services:
+  # bge-m3 の埋め込み。実行ファイル llama-server に用途の名前の symlink（/app/bge-m3-embed）を張ってそれで起動するので、
+  # ps と /proc/<pid>/comm には bge-m3-embed と出る（2026-10-30 に確かめた）。
+  embed:
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_CPP_VERSION:-server-b12004}   # arm64 あり。2026-10-30 の版（build 12004、commit 3c809f443）
+    container_name: bge-m3-embed
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    networks:
+      default:
+        aliases: [ollama]   # 使う側（hindsight-docker、honcho-docker）が見ているホスト名
+    volumes:
+      # 重みは ollama が落とした bge-m3 の blob をそのまま読む（読み取り専用。コピーしない＝ollama のときと同じ重みであることを保証する）
+      - models:/models:ro
+    entrypoint: ["/bin/sh", "-c", "ln -sf llama-server /app/bge-m3-embed && exec /app/bge-m3-embed \"$@\"", "--"]
+    # 引数は ollama 0.40.5 が bge-m3 に立てていた llama-server の起動（docker top で見たもの）に合わせた。
+    # ollama 固有のもの（--load-mode none、--log-verbosity、--no-log-prefix 等）と、埋め込みでは効かない --context-shift --keep は落とした。
+    # --alias bge-m3: /v1/models と応答の model 欄の名前
+    command:
+      - --model
+      - /models/models/blobs/sha256-daec91ffb5dd0c27411bd71f29932917c49cf529a641d0168496c3a501e3062c   # bge-m3:latest（ollama の ID 790764642607）
+      - --alias
+      - bge-m3
+      - --host
+      - 0.0.0.0
+      - --port
+      - "11434"
+      - --no-webui
+      - --offline
+      - --embedding
+      - -c
+      - "4096"
+      - -np
+      - "1"
+      - -b
+      - "2048"
+      - -ub
+      - "2048"
+      - --flash-attn
+      - auto
+    healthcheck:
+      # イメージの既定は localhost:8080 を見るので、ポートに合わせて上書き
+      test: ["CMD", "curl", "-f", "http://localhost:11434/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    # 箱のほかのサービスを守る安全弁。待機の実測は README
+    mem_limit: ${EMBED_MEM_LIMIT:-2g}
+
+  # ---- ここから下は退避（profile `ollama`。docker compose up では上がらない）。戻すときだけ使う ----
   ollama:
-    image: ollama/ollama:${OLLAMA_VERSION:-0.40.5}   # arm64 あり。2026-10-16 時点の最新リリース
+    profiles: [ollama]
+    image: ollama/ollama:${OLLAMA_VERSION:-0.40.5}
     container_name: ollama
     restart: unless-stopped
     ports:
       - "127.0.0.1:11434:11434"
     environment:
-      # 使わないモデルをメモリから下ろすまでの時間。-1＝下ろさない（呼ばれるたびに読み直さないよう常駐）
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
-      # 同時に載せるモデルの数。2＝埋め込み（Hindsight 用）と小型 LLM（MCP 用）を両方常駐させる
       OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
       OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
     volumes:
-      - models:/root/.ollama    # 落としたモデル（ollama_models）。down に -v を付けなければ残る
-    # 箱のほかのサービスを守る安全弁。embeddinggemma Q8 と qwen3 1.7B Q4_K_M を同時に載せた待機が約 2.5GiB（README の計測）。
-    # もっと大きいモデルを載せるときは .env の OLLAMA_MEM_LIMIT で上げる（Qwen3-Embedding 4B Q4 は読み込みで 3.1GiB）
+      - models:/root/.ollama    # 落としたモデル（ollama_models）。embed も読み取り専用で使う
     mem_limit: ${OLLAMA_MEM_LIMIT:-4g}
 
-  # MCP の橋渡し。ollama-mcp-server（hyzhak、stdio。run／chat_completion に think と temperature を渡せる。pull／push／rm／cp／create の
-  # 道具も出すので、使う側（Claude Code）の deny で塞ぐ＝README）を mcp-proxy で streamable HTTP にする。Claude Code からは http://127.0.0.1:11435/mcp
+  # MCP の橋渡し（ollama-mcp-server + mcp-proxy、127.0.0.1:11435/mcp）。ollama の API を叩くので、ollama と一緒に退避
   mcp:
-    image: oven/bun:${BUN_VERSION:-1.4.3-alpine}   # arm64 あり
+    profiles: [ollama]
+    image: oven/bun:${BUN_VERSION:-1.4.3-alpine}
     container_name: ollama-mcp
     restart: unless-stopped
     depends_on: [ollama]
     ports:
       - "127.0.0.1:${OLLAMA_MCP_PORT:-11435}:8080"
     environment:
-      OLLAMA_HOST: http://ollama:11434   # 橋渡しが叩く先。モデルは道具の引数で指す（既定は無い。README の qwen3:1.7b と think:false）
-    # --server stream: streamable HTTP だけ（旧い SSE の口は開けない）。--host 0.0.0.0: コンテナ内で全 IF（外へは ports の 127.0.0.1 だけ）
-    # bunx --bun: 橋渡しの cli が node を spawn するので、bun を node として見せる
+      OLLAMA_HOST: http://ollama:11434
     command: ["bunx", "mcp-proxy@${MCP_PROXY_VERSION:-6.7.20}", "--host", "0.0.0.0", "--port", "8080", "--server", "stream", "--",
               "bunx", "--bun", "ollama-mcp-server@${OLLAMA_MCP_VERSION:-1.1.0}"]
     volumes:
-      - bun_cache:/root/.bun    # bunx が落としたパッケージ。再起動のたびに落とし直さない
-    mem_limit: ${OLLAMA_MCP_MEM_LIMIT:-512m}   # 実測の待機 74MiB
+      - bun_cache:/root/.bun
+    mem_limit: ${OLLAMA_MCP_MEM_LIMIT:-512m}
 
 networks:
   default:
